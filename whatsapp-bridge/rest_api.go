@@ -192,7 +192,9 @@ func (b *Bridge) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (b *Bridge) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"healthy":    true,
+		"status":     "healthy",
+		"service":    "whatsapp-bridge",
+		"version":    "0.1.0",
 		"user_count": b.UserCount(),
 	})
 }

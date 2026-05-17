@@ -4,7 +4,11 @@ from django.http import JsonResponse
 
 
 def health_check(request):
-    return JsonResponse({'status': 'healthy'})
+    return JsonResponse({
+        'status': 'healthy',
+        'service': 'whatsapp-django',
+        'version': '0.1.0'
+    })
 
 
 urlpatterns = [
