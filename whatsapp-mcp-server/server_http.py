@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-HTTP MCP Server with JWT authentication.
-This server provides MCP protocol over HTTP with JWT Bearer token validation.
+MCP Server with JWT authentication using MCP SDK's FastMCP.
+
+This implementation uses MCP SDK's streamable-http transport which is fully
+MCP protocol compliant. JWT authentication is handled via a custom TokenVerifier.
 """
 
 import os
 import logging
-from typing import Optional
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Header, Request
-from pydantic import BaseModel
+from starlette.responses import JSONResponse
+from starlette.requests import Request
+from pydantic import AnyHttpUrl
+
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.auth.provider import TokenVerifier, AccessToken
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.middleware.auth_context import auth_context_var
 
 from auth import validate_jwt, check_user_exists_in_django, validate_no_user_id_in_arguments
 from whatsapp import (
@@ -30,194 +38,237 @@ from whatsapp import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SERVICE_KEY = os.environ.get("SERVICE_KEY", "")
 BRIDGE_API_URL = os.environ.get("BRIDGE_API_URL", "http://localhost:8080/api")
-
-app = FastAPI(title="WhatsApp MCP HTTP Server")
-
-
-class ToolRequest(BaseModel):
-    tool: str
-    arguments: dict
+SERVICE_KEY = os.environ.get("SERVICE_KEY", "")
 
 
-def get_user_id_from_jwt(authorization: str) -> Optional[str]:
-    """Extract and validate JWT from Authorization header."""
-    if not authorization:
-        return None
-    if not authorization.startswith("Bearer "):
-        return None
-    token = authorization[7:]
-    return validate_jwt(token)
+def get_user_id_from_context() -> str | None:
+    """Extract user_id from the current request's auth context."""
+    user = auth_context_var.get()
+    if user and hasattr(user, 'access_token') and user.access_token:
+        return user.access_token.client_id
+    return None
 
 
-def validate_and_get_user_id(authorization: str) -> str:
-    """Validate JWT and check user exists in Django."""
-    user_id = get_user_id_from_jwt(authorization)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Missing or invalid JWT")
+class JWTTokenVerifier(TokenVerifier):
+    """TokenVerifier that validates JWTs and checks user existence."""
 
-    if not check_user_exists_in_django(user_id):
-        raise HTTPException(status_code=403, detail="User no longer exists")
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """
+        Verify a bearer token and return access info if valid.
 
-    return user_id
+        Returns AccessToken with client_id set to our user_id, or None if invalid.
+        """
+        try:
+            user_id = validate_jwt(token)
+            if not user_id:
+                return None
+
+            if not check_user_exists_in_django(user_id):
+                return None
+
+            return AccessToken(
+                token=token,
+                client_id=user_id,
+                scopes=["mcp"],
+                expires_at=None
+            )
+        except Exception as e:
+            logger.warning(f"JWT validation failed: {e}")
+            return None
 
 
-@app.get("/health/")
-def health_check():
-    """Health check endpoint - no auth required."""
-    return {
+auth_settings = AuthSettings(
+    issuer_url=AnyHttpUrl("http://localhost/auth"),
+    resource_server_url=AnyHttpUrl("http://localhost/mcp"),
+    required_scopes=["mcp"],
+)
+
+mcp = FastMCP(
+    name="whatsapp-mcp-server",
+    instructions="WhatsApp MCP Server with multi-tenant support via JWT authentication",
+    host="0.0.0.0",
+    port=int(os.environ.get("MCP_PORT", "8001")),
+    streamable_http_path="/mcp",
+    json_response=True,
+    token_verifier=JWTTokenVerifier(),
+    auth=auth_settings,
+)
+
+
+@mcp.custom_route("/health/", methods=["GET"])
+async def health_check(request: Request) -> JSONResponse:
+    """Health check endpoint."""
+    return JSONResponse({
         "status": "healthy",
-        "service": "whatsapp-mcp-http",
+        "service": "whatsapp-mcp",
         "version": "0.1.0"
-    }
+    })
 
 
-@app.get("/mcp/")
-def mcp_get(authorization: Optional[str] = Header(None)):
-    """MCP GET endpoint - establishes connection."""
-    user_id = validate_and_get_user_id(authorization) if authorization else None
+@mcp.tool()
+async def search_contacts(query: str, ctx: Context = None) -> str:
+    """Search WhatsApp contacts by name or phone number."""
+    user_id = get_user_id_from_context()
     if not user_id:
-        raise HTTPException(status_code=401, detail="Missing or invalid JWT")
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"query": query})
+    result = whatsapp_search_contacts(user_id, query)
+    return str(result)
 
-    logger.info(f"MCP GET connection opened for user_id: {user_id}")
-    return {"status": "connected", "user_id": user_id}
 
-
-@app.post("/mcp/")
-async def mcp_post(request: Request, authorization: Optional[str] = Header(None)):
-    """MCP POST endpoint - handles tool calls."""
-    user_id = validate_and_get_user_id(authorization) if authorization else None
+@mcp.tool()
+async def list_messages(
+    after: str | None = None,
+    before: str | None = None,
+    sender_phone_number: str | None = None,
+    chat_jid: str | None = None,
+    query: str | None = None,
+    limit: int = 20,
+    page: int = 0,
+    include_context: bool = True,
+    context_before: int = 1,
+    context_after: int = 1
+) -> str:
+    """Get WhatsApp messages matching specified criteria."""
+    user_id = get_user_id_from_context()
     if not user_id:
-        raise HTTPException(status_code=401, detail="Missing or invalid JWT")
-
-    try:
-        body = await request.json()
-        tool_name = body.get("tool")
-        arguments = body.get("arguments", {})
-
-        if not tool_name:
-            raise HTTPException(status_code=400, detail="Missing tool name")
-
-        validate_no_user_id_in_arguments(arguments)
-
-        result = await execute_tool(user_id, tool_name, arguments)
-
-        return {"success": True, "result": result}
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except HTTPException as e:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Tool execution error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({
+        "after": after, "before": before, "sender_phone_number": sender_phone_number,
+        "chat_jid": chat_jid, "query": query, "limit": limit, "page": page
+    })
+    result = whatsapp_list_messages(
+        user_id=user_id, after=after, before=before,
+        sender_phone_number=sender_phone_number, chat_jid=chat_jid, query=query,
+        limit=limit, page=page, include_context=include_context,
+        context_before=context_before, context_after=context_after
+    )
+    return str(result)
 
 
-async def execute_tool(user_id: str, tool_name: str, arguments: dict):
-    """Execute MCP tool by name using context-based user_id."""
-    logger.info(f"Executing tool {tool_name} for user {user_id}")
-
-    if tool_name == "search_contacts":
-        return whatsapp_search_contacts(user_id, arguments.get("query"))
-    elif tool_name == "list_messages":
-        return whatsapp_list_messages(
-            user_id=user_id,
-            after=arguments.get("after"),
-            before=arguments.get("before"),
-            sender_phone_number=arguments.get("sender_phone_number"),
-            chat_jid=arguments.get("chat_jid"),
-            query=arguments.get("query"),
-            limit=arguments.get("limit", 20),
-            page=arguments.get("page", 0),
-            include_context=arguments.get("include_context", True),
-            context_before=arguments.get("context_before", 1),
-            context_after=arguments.get("context_after", 1)
-        )
-    elif tool_name == "list_chats":
-        return whatsapp_list_chats(
-            user_id=user_id,
-            query=arguments.get("query"),
-            limit=arguments.get("limit", 20),
-            page=arguments.get("page", 0),
-            include_last_message=arguments.get("include_last_message", True),
-            sort_by=arguments.get("sort_by", "last_active")
-        )
-    elif tool_name == "get_chat":
-        return whatsapp_get_chat(
-            user_id=user_id,
-            chat_jid=arguments.get("chat_jid"),
-            include_last_message=arguments.get("include_last_message", True)
-        )
-    elif tool_name == "get_direct_chat_by_contact":
-        return whatsapp_get_direct_chat_by_contact(
-            user_id=user_id,
-            sender_phone_number=arguments.get("sender_phone_number")
-        )
-    elif tool_name == "get_contact_chats":
-        return whatsapp_get_contact_chats(
-            user_id=user_id,
-            jid=arguments.get("jid"),
-            limit=arguments.get("limit", 20),
-            page=arguments.get("page", 0)
-        )
-    elif tool_name == "get_last_interaction":
-        return whatsapp_get_last_interaction(
-            user_id=user_id,
-            jid=arguments.get("jid")
-        )
-    elif tool_name == "get_message_context":
-        return whatsapp_get_message_context(
-            message_id=arguments.get("message_id"),
-            user_id=user_id,
-            before=arguments.get("before", 5),
-            after=arguments.get("after", 5)
-        )
-    elif tool_name == "send_message":
-        return whatsapp_send_message(
-            user_id=user_id,
-            recipient=arguments.get("recipient"),
-            message=arguments.get("message")
-        )
-    elif tool_name == "send_file":
-        return whatsapp_send_file(
-            user_id=user_id,
-            recipient=arguments.get("recipient"),
-            media_path=arguments.get("media_path")
-        )
-    elif tool_name == "send_audio_message":
-        return whatsapp_audio_voice_message(
-            user_id=user_id,
-            recipient=arguments.get("recipient"),
-            media_path=arguments.get("media_path")
-        )
-    elif tool_name == "download_media":
-        return whatsapp_download_media(
-            user_id=user_id,
-            message_id=arguments.get("message_id"),
-            chat_jid=arguments.get("chat_jid")
-        )
-    else:
-        raise ValueError(f"Unknown tool: {tool_name}")
+@mcp.tool()
+async def list_chats(
+    query: str | None = None,
+    limit: int = 20,
+    page: int = 0,
+    include_last_message: bool = True,
+    sort_by: str = "last_active"
+) -> str:
+    """Get WhatsApp chats matching specified criteria."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({
+        "query": query, "limit": limit, "page": page, "include_last_message": include_last_message, "sort_by": sort_by
+    })
+    result = whatsapp_list_chats(
+        user_id=user_id, query=query, limit=limit, page=page,
+        include_last_message=include_last_message, sort_by=sort_by
+    )
+    return str(result)
 
 
-@app.get("/")
-def root():
-    """Root endpoint."""
-    return {
-        "service": "whatsapp-mcp-http",
-        "version": "0.1.0",
-        "endpoints": {
-            "health": "/health/",
-            "mcp": "/mcp/"
-        }
-    }
+@mcp.tool()
+async def get_chat(chat_jid: str, include_last_message: bool = True) -> str:
+    """Get WhatsApp chat metadata by JID."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"chat_jid": chat_jid})
+    result = whatsapp_get_chat(user_id=user_id, chat_jid=chat_jid, include_last_message=include_last_message)
+    return str(result)
+
+
+@mcp.tool()
+async def get_direct_chat_by_contact(sender_phone_number: str) -> str:
+    """Get WhatsApp chat metadata by sender phone number."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"sender_phone_number": sender_phone_number})
+    result = whatsapp_get_direct_chat_by_contact(user_id=user_id, sender_phone_number=sender_phone_number)
+    return str(result)
+
+
+@mcp.tool()
+async def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> str:
+    """Get all WhatsApp chats involving a contact."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"jid": jid, "limit": limit, "page": page})
+    result = whatsapp_get_contact_chats(user_id=user_id, jid=jid, limit=limit, page=page)
+    return str(result)
+
+
+@mcp.tool()
+async def get_last_interaction(jid: str) -> str:
+    """Get most recent WhatsApp message involving a contact."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"jid": jid})
+    result = whatsapp_get_last_interaction(user_id=user_id, jid=jid)
+    return str(result)
+
+
+@mcp.tool()
+async def get_message_context(message_id: str, before: int = 5, after: int = 5) -> str:
+    """Get context around a specific WhatsApp message."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"message_id": message_id, "before": before, "after": after})
+    result = whatsapp_get_message_context(message_id=message_id, user_id=user_id, before=before, after=after)
+    return str(result)
+
+
+@mcp.tool()
+async def send_message(recipient: str, message: str) -> str:
+    """Send a WhatsApp message to a person or group."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"recipient": recipient, "message": message})
+    result = whatsapp_send_message(user_id=user_id, recipient=recipient, message=message)
+    return str(result)
+
+
+@mcp.tool()
+async def send_file(recipient: str, media_path: str) -> str:
+    """Send a file via WhatsApp."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"recipient": recipient, "media_path": media_path})
+    result = whatsapp_send_file(user_id=user_id, recipient=recipient, media_path=media_path)
+    return str(result)
+
+
+@mcp.tool()
+async def send_audio_message(recipient: str, media_path: str) -> str:
+    """Send an audio file as WhatsApp voice message."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"recipient": recipient, "media_path": media_path})
+    result = whatsapp_audio_voice_message(user_id=user_id, recipient=recipient, media_path=media_path)
+    return str(result)
+
+
+@mcp.tool()
+async def download_media(message_id: str, chat_jid: str) -> str:
+    """Download media from a WhatsApp message."""
+    user_id = get_user_id_from_context()
+    if not user_id:
+        return '{"error": "Authentication required"}'
+    validate_no_user_id_in_arguments({"message_id": message_id, "chat_jid": chat_jid})
+    result = whatsapp_download_media(user_id=user_id, message_id=message_id, chat_jid=chat_jid)
+    return str(result)
 
 
 if __name__ == "__main__":
-    import uvicorn
-    host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8001"))
-    logger.info(f"Starting WhatsApp MCP HTTP server on {host}:{port}")
-    uvicorn.run(app, host=host, port=port)
+    import sys
+    transport = sys.argv[1] if len(sys.argv) > 1 else "streamable-http"
+    mcp.run(transport=transport)
