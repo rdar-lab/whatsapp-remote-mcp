@@ -7,6 +7,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -304,7 +305,19 @@ func (b *Bridge) handleHistorySync(uc *UserClient, sync *events.HistorySync) {
 	b.logger.Infof("History sync complete for user %s. Stored %d messages.", uc.UserID, syncedCount)
 }
 
-func (b *Bridge) getChatName(uc *UserClient, chatJID string, conversation interface{}) string {
+func (b *Bridge) getChatName(uc *UserClient, chatJID string, conversation *waHistorySync.Conversation) string {
+	if conversation == nil {
+		return chatJID
+	}
+	if name := conversation.GetName(); name != "" {
+		return name
+	}
+	if name := conversation.GetDisplayName(); name != "" {
+		return name
+	}
+	if name := conversation.GetUsername(); name != "" {
+		return name
+	}
 	return chatJID
 }
 
